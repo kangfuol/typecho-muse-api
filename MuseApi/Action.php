@@ -309,7 +309,16 @@ class Action extends Base implements ActionInterface
         $mime = Common::mimeContentType($tmpName);
 
         if ($mime !== self::IMAGE_MIME_BY_EXT[$ext]) {
-            $this->fail('文件内容与扩展名不符（检测到 ' . $mime . '）', 400, 'bad_file_type');
+            // 有的服务器 fileinfo 的 magic 库损坏，会把所有文件都认成
+            // application/octet-stream（在某些服务器上实测即如此）；此时改用
+            // 图片结构解析二次核对，假图片过不了这一关。
+            if ('application/octet-stream' === $mime || '' === $mime) {
+                $mime = $this->detectImageMime($tmpName);
+            }
+
+            if ($mime !== self::IMAGE_MIME_BY_EXT[$ext]) {
+                $this->fail('文件内容与扩展名不符（检测到 ' . $mime . '）', 400, 'bad_file_type');
+            }
         }
 
         // 核心上传：命名、建目录、移动文件（与后台上传同一条路）
@@ -379,6 +388,45 @@ class Action extends Base implements ActionInterface
             'mime'         => $result['mime'],
             'type'         => $result['type'],
         ]]);
+    }
+
+    /**
+     * 检测图片的真实 MIME（fileinfo 失效时的兜底）。
+     *
+     * 先用 getimagesize() 解析图片结构（假图片过不了），再不济按文件头
+     * 特征码判断。只认 jpg/png/webp/gif 四种，认不出返回空字符串。
+     */
+    private function detectImageMime(string $path): string
+    {
+        $info = @getimagesize($path);
+
+        if (is_array($info) && isset($info['mime'])) {
+            return (string)$info['mime'];
+        }
+
+        $head = @file_get_contents($path, false, null, 0, 12);
+
+        if (!is_string($head)) {
+            return '';
+        }
+
+        if (str_starts_with($head, "\xFF\xD8\xFF")) {
+            return 'image/jpeg';
+        }
+
+        if (str_starts_with($head, "\x89PNG\r\n\x1A\n")) {
+            return 'image/png';
+        }
+
+        if (str_starts_with($head, 'GIF87a') || str_starts_with($head, 'GIF89a')) {
+            return 'image/gif';
+        }
+
+        if (str_starts_with($head, 'RIFF') && 'WEBP' === substr($head, 8, 4)) {
+            return 'image/webp';
+        }
+
+        return '';
     }
 
     // ------------------------------------------------------------------

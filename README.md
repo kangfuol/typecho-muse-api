@@ -15,6 +15,10 @@
 1. 把 `MuseApi` 文件夹（内含 `Plugin.php`、`Action.php`）上传到
    `usr/plugins/`，即 `usr/plugins/MuseApi/Plugin.php`、
    `usr/plugins/MuseApi/Action.php`。
+   **注意权限**：两个 `.php` 文件必须能被 Web 服务器（PHP 进程）
+   读取，一般是 `644`。如果传上去是 `660` 且属主是 root，PHP 读不到，
+   后台会显示“此插件文件已经损坏或者被不安全移除”——这时先把权限改
+   成 `644` 再刷新页面，**不要点禁用**（停用会删 Token）。
 2. 后台 → 插件 → 找到 **MuseApi** → 启用。
    启用时自动生成一个 48 字符的随机 Token 并注册接口路由。
 3. 后台 → 插件 → MuseApi 的「设置」，复制 **API Token**，
@@ -24,10 +28,15 @@
 
 接口地址：`POST https://your-blog.example/index.php/action/muse-api`
 
-> **从 v1.0 升级到 v1.1**：直接用新版 `Plugin.php`、`Action.php`
+> **从 v1.1 升级到 v1.1.1**：直接用新版 `Plugin.php`、`Action.php`
 > 覆盖 `usr/plugins/MuseApi/` 下的同名文件即可，**不需要停用再启用**，
 > Token 存在数据库配置里、不会变，接口路由也没有变。
 > （停用会删配置、重新启用会换 Token，只有换 Token 时才需要停用。）
+
+> **版本历史**：v1.1.0 增加了 `upload_image`；v1.1.1 修复了上传
+> 的 MIME 检测——有的服务器 fileinfo 的 magic 库损坏，会把所有文件
+> 都认成 `application/octet-stream`，导致真图片也被拒绝，v1.1.1
+> 在这种情况下改用 `getimagesize()` + 文件头特征码二次核对。
 
 ## Token 管理
 
@@ -356,7 +365,12 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
   `delete_comment` 均正常；上传后把返回 URL 写进草稿正文再取回也正常。
   另验证：直接覆盖 `Plugin.php` / `Action.php`（不重启、不停用插件）
   后同一 Token 继续有效——升级 v1.1 不需要停用再启用。
-- 已在真实站点上验证了只读接口、评论删除和草稿创建；图片上传在本地通过测试，安装后请先用只读接口
-  （`list_posts`、`list_comments`）验证，再试写操作。线上 PHP 的
-  `upload_max_filesize` / `post_max_size` 若小于 10MB，会先于插件
-  拦截大文件（此时报错为 `upload_error`），属服务器配置而非插件问题。
+- **v1.1.1 补测**（同一本地环境）：模拟 fileinfo 损坏（强制返回
+  `application/octet-stream`）后，真 JPEG/PNG/GIF/WebP 仍可上传成功，
+  文本冒充 `.jpg` 仍被拒绝；正常路径的上传与回归接口均不受影响。
+- 已在真实站点上安装 v1.1.0 并验证：只读接口正常，Token 有效；
+  但线上站的 fileinfo 会把真图片认成 `application/octet-stream`，
+  导致 v1.1.0 的上传被拒——v1.1.1 已针对性修复，升级后请再试传一张。
+  线上 PHP 的 `upload_max_filesize` / `post_max_size` 若小于 10MB，
+  会先于插件拦截大文件（此时报错为 `upload_error`），属服务器配置
+  而非插件问题。
