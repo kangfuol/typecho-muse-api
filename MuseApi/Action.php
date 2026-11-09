@@ -4,8 +4,8 @@
  *
  * 请求：POST，请求头 X-Muse-Token: <Token>。
  *   - 评论/文章 12 个动作：JSON 请求体 {"action": "list_comments", ...}。
- *   - 上传图片 upload_image：multipart/form-data，字段 action=upload_image，
- *     文件字段 file。
+ *   - 上传图片 upload_image / 上传视频 upload_video：multipart/form-data，
+ *     字段 action=upload_image 或 upload_video，文件字段 file。
  * 响应：JSON，成功 {"success": true, ...}，失败 {"success": false, "error": "...", "code": "..."}。
  *
  * 鉴权后以配置的 API 用户（默认 muse，须为编辑或管理员）临时登录
@@ -49,7 +49,7 @@ class Action extends Base implements ActionInterface
     /**
      * JSON 动作分发表：请求里的 action 名 => 本类方法名
      * （只做评论和文章；没有用户/设置/链接/主题插件/备份操作，
-     *  也没有删除文章接口。upload_image 是 multipart 请求，
+     *  也没有删除文章接口。upload_image / upload_video 是 multipart 请求，
      *  不走这张表，见 handleMultipart()。）
      */
     private const DISPATCH = [
@@ -79,13 +79,36 @@ class Action extends Base implements ActionInterface
     /** 单张图片上传上限（10MB） */
     private const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 
-    /** 允许上传的图片扩展名 => 检测到的 MIME（扩展名与实测 MIME 必须一致） */
+    /** 单个视频上传上限（100MB） */
+    private const MAX_VIDEO_SIZE = 100 * 1024 * 1024;
+
+    /**
+     * 允许上传的图片扩展名 => 检测到的 MIME（扩展名与实测 MIME 必须一致）。
+     * 要支持新图片格式时只改这张表，不用加新接口。
+     */
     private const IMAGE_MIME_BY_EXT = [
         'jpg'  => 'image/jpeg',
         'jpeg' => 'image/jpeg',
         'png'  => 'image/png',
-        'webp' => 'image/webp',
         'gif'  => 'image/gif',
+        'webp' => 'image/webp',
+        'avif' => 'image/avif',
+        'bmp'  => 'image/bmp',
+    ];
+
+    /**
+     * 允许上传的视频扩展名 => 检测到的 MIME（扩展名与实测 MIME 必须一致）。
+     * 要支持新视频格式时只改这张表，不用加新接口。
+     */
+    private const VIDEO_MIME_BY_EXT = [
+        'mp4'  => 'video/mp4',
+        'm4v'  => 'video/mp4',
+        'mov'  => 'video/quicktime',
+        'webm' => 'video/webm',
+        'mkv'  => 'video/x-matroska',
+        'avi'  => 'video/x-msvideo',
+        'flv'  => 'video/x-flv',
+        'wmv'  => 'video/x-ms-asf',
     ];
 
     /**
@@ -114,7 +137,7 @@ class Action extends Base implements ActionInterface
             $this->fail('只接受 POST 请求', 405, 'method_not_allowed');
         }
 
-        // multipart/form-data 只走图片上传分支（upload_image）；
+        // multipart/form-data 只走文件上传分支（upload_image / upload_video）；
         // 其余 12 个动作一律走下面的 JSON 分发，不动。
         $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
 
@@ -236,35 +259,60 @@ class Action extends Base implements ActionInterface
     }
 
     // ------------------------------------------------------------------
-    // 图片上传（multipart）
+    // 文件上传（multipart）
     // ------------------------------------------------------------------
 
     /**
-     * multipart 入口：只接受 action=upload_image。
+     * multipart 入口：只接受 action=upload_image / upload_video。
      * 鉴权在碰文件之前完成（与 JSON 路径一致）。
      */
     private function handleMultipart(): void
     {
         $action = $_POST['action'] ?? null;
 
-        if (!is_string($action) || 'upload_image' !== $action) {
-            $this->fail('multipart 请求只支持 upload_image', 400, 'bad_request');
+        if (!is_string($action)
+            || !in_array($action, ['upload_image', 'upload_video'], true)) {
+            $this->fail('multipart 请求只支持 upload_image / upload_video', 400, 'bad_request');
         }
 
         $this->authenticate();
         $this->loginApiUser();
+
+        if ('upload_video' === $action) {
+            $this->uploadVideo();
+            return;
+        }
+
         $this->uploadImage();
     }
 
     /**
      * 上传图片：multipart/form-data，文件字段名 file。
      *
-     * 只收图片（jpg/jpeg/png/webp/gif），扩展名与实测 MIME 必须一致，
-     * 单文件上限 10MB。存储走核心 Widget\Upload::uploadHandle()（后台
-     * 上传同一条路：usr/uploads/YYYY/MM/、crc32 命名、重名不覆盖），
-     * 再按核心 upload() 的结构把附件行写入 contents 表。
+     * 格式表 + 上限见 IMAGE_MIME_BY_EXT / MAX_IMAGE_SIZE（图片 10MB）。
+     * 校验与存储都走共用的 uploadFile()，见下。
      */
     private function uploadImage(): void
+    {
+        $this->uploadFile(
+            self::IMAGE_MIME_BY_EXT,
+            self::MAX_IMAGE_SIZE,
+            '图片',
+            $this->detectImageMime(...)
+        );
+    }
+
+    /**
+     * 文件上传总流程（图片/视频共用；格式表 + 上限是唯一的扩展点）。
+     *
+     * $mimeByExt：允许的扩展名 => 实测 MIME；$maxSize：单文件上限（字节）；
+     * $kindLabel：报错里用的称呼（“图片”/“视频”）；$detectFallback：
+     * fileinfo 失效时用的兜底检测，签名 detectXxxMime(路径, 期望 MIME)。
+     * 存储走核心 Widget\Upload::uploadHandle()（后台上传同一条路：
+     * usr/uploads/YYYY/MM/、crc32 命名、重名不覆盖），再按核心 upload()
+     * 的结构把附件行写入 contents 表，见 storeUpload()。
+     */
+    private function uploadFile(array $mimeByExt, int $maxSize, string $kindLabel, callable $detectFallback): void
     {
         $file = $_FILES['file'] ?? null;
 
@@ -275,7 +323,9 @@ class Action extends Base implements ActionInterface
         $error = (int)($file['error'] ?? UPLOAD_ERR_NO_FILE);
 
         if (UPLOAD_ERR_INI_SIZE === $error || UPLOAD_ERR_FORM_SIZE === $error) {
-            $this->fail('文件超过服务器允许的上传大小', 400, 'file_too_large');
+            $this->fail('文件超过服务器允许的上传大小（upload_max_filesize='
+                . ini_get('upload_max_filesize') . '，post_max_size='
+                . ini_get('post_max_size') . '）', 400, 'file_too_large');
         }
 
         if (UPLOAD_ERR_OK !== $error) {
@@ -294,33 +344,67 @@ class Action extends Base implements ActionInterface
             $size = (int)@filesize($tmpName);
         }
 
-        if ($size > self::MAX_IMAGE_SIZE) {
-            $this->fail('图片超过 10MB 上限', 400, 'file_too_large');
+        if ($size > $maxSize) {
+            $this->fail($kindLabel . '超过 ' . $this->formatSizeMb($maxSize) . ' 上限', 400, 'file_too_large');
         }
 
         $originalName = (string)($file['name'] ?? '');
         $ext = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
 
-        if (!isset(self::IMAGE_MIME_BY_EXT[$ext])) {
-            $this->fail('只接受图片（jpg、jpeg、png、webp、gif）', 400, 'bad_file_type');
+        if (!isset($mimeByExt[$ext])) {
+            $this->fail('只接受' . $kindLabel . '（' . implode('、', array_keys($mimeByExt)) . '）', 400, 'bad_file_type');
         }
 
         // 实测 MIME（不信任客户端传的 MIME）：必须与扩展名对应
         $mime = Common::mimeContentType($tmpName);
 
-        if ($mime !== self::IMAGE_MIME_BY_EXT[$ext]) {
+        if ($mime !== $mimeByExt[$ext]) {
             // 有的服务器 fileinfo 的 magic 库损坏，会把所有文件都认成
             // application/octet-stream（在某些服务器上实测即如此）；此时改用
-            // 图片结构解析二次核对，假图片过不了这一关。
+            // 文件头特征码二次核对，假文件过不了这一关。
             if ('application/octet-stream' === $mime || '' === $mime) {
-                $mime = $this->detectImageMime($tmpName);
+                $mime = $detectFallback($tmpName, $mimeByExt[$ext]);
             }
 
-            if ($mime !== self::IMAGE_MIME_BY_EXT[$ext]) {
+            if ($mime !== $mimeByExt[$ext]) {
                 $this->fail('文件内容与扩展名不符（检测到 ' . $mime . '）', 400, 'bad_file_type');
             }
         }
 
+        $this->storeUpload($file);
+    }
+
+    /** 字节数格式化为 MB（如 10485760 → 10MB），只用于报错文本 */
+    private function formatSizeMb(int $bytes): string
+    {
+        return (string)($bytes / (1024 * 1024)) . 'MB';
+    }
+
+    /**
+     * 上传视频：multipart/form-data，文件字段名 file。
+     *
+     * 格式表 + 上限见 VIDEO_MIME_BY_EXT / MAX_VIDEO_SIZE（视频 100MB）。
+     * 校验与存储都走共用的 uploadFile()，见上。
+     */
+    private function uploadVideo(): void
+    {
+        $this->uploadFile(
+            self::VIDEO_MIME_BY_EXT,
+            self::MAX_VIDEO_SIZE,
+            '视频',
+            $this->detectVideoMime(...)
+        );
+    }
+
+    /**
+     * 核心上传并写附件记录（图片/视频共用）。
+     *
+     * 走核心 Widget\Upload::uploadHandle()（后台上传同一条路：
+     * usr/uploads/YYYY/MM/、crc32 命名、重名不覆盖），再按核心
+     * upload() 的结构把附件行写入 contents 表，最后核对并返回。
+     */
+    private function storeUpload(array $file): void
+    {
         // 核心上传：命名、建目录、移动文件（与后台上传同一条路）
         $result = Upload::uploadHandle($file);
 
@@ -394,9 +478,11 @@ class Action extends Base implements ActionInterface
      * 检测图片的真实 MIME（fileinfo 失效时的兜底）。
      *
      * 先用 getimagesize() 解析图片结构（假图片过不了），再不济按文件头
-     * 特征码判断。只认 jpg/png/webp/gif 四种，认不出返回空字符串。
+     * 特征码判断。只认 jpg/png/gif/webp/avif/bmp，认不出返回空字符串。
+     * $expectedMime 仅为与视频兜底统一签名而保留，图片每种格式都有
+     * 唯一特征码，用不上它。
      */
-    private function detectImageMime(string $path): string
+    private function detectImageMime(string $path, string $expectedMime = ''): string
     {
         $info = @getimagesize($path);
 
@@ -424,6 +510,62 @@ class Action extends Base implements ActionInterface
 
         if (str_starts_with($head, 'RIFF') && 'WEBP' === substr($head, 8, 4)) {
             return 'image/webp';
+        }
+
+        // AVIF：ftyp 盒子，主品牌在第 9–12 字节（avif / avis）
+        if (strlen($head) >= 12 && 'ftyp' === substr($head, 4, 4)
+            && in_array(substr($head, 8, 4), ['avif', 'avis'], true)) {
+            return 'image/avif';
+        }
+
+        // BMP：文件头 BM
+        if (str_starts_with($head, 'BM')) {
+            return 'image/bmp';
+        }
+
+        return '';
+    }
+
+    /**
+     * 检测视频的真实 MIME（fileinfo 失效时的兜底）。
+     *
+     * 只按容器族的文件头特征码判断：mp4/m4v/mov 看 ftyp 盒子，
+     * webm/mkv 看 EBML 头，avi 看 RIFF+AVI，flv 看 FLV 头，
+     * wmv 看 ASF GUID。同一容器族无法从文件头区分具体格式
+     * （比如 mp4/mov 都是 ftyp），所以通过时返回调用方期望的
+     * MIME（$expectedMime），不通过返回空字符串。
+     */
+    private function detectVideoMime(string $path, string $expectedMime): string
+    {
+        $head = @file_get_contents($path, false, null, 0, 16);
+
+        if (!is_string($head) || strlen($head) < 12) {
+            return '';
+        }
+
+        // mp4 / m4v / mov：ISO BMFF，盒子类型在第 5–8 字节
+        if ('ftyp' === substr($head, 4, 4)) {
+            return $expectedMime;
+        }
+
+        // webm / mkv：EBML 头 1A 45 DF A3
+        if (str_starts_with($head, "\x1A\x45\xDF\xA3")) {
+            return $expectedMime;
+        }
+
+        // avi：RIFF 头 + 第 9–12 字节 AVI␣
+        if (str_starts_with($head, 'RIFF') && 'AVI ' === substr($head, 8, 4)) {
+            return $expectedMime;
+        }
+
+        // flv：FLV 头
+        if (str_starts_with($head, 'FLV')) {
+            return $expectedMime;
+        }
+
+        // wmv：ASF GUID
+        if (str_starts_with($head, "\x30\x26\xB2\x75\x8E\x66\xCF\x11\xA6\xD9\x00\xAA\x00\x62\xCE\x6C")) {
+            return $expectedMime;
         }
 
         return '';

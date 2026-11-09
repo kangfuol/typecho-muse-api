@@ -1,12 +1,12 @@
-# MuseApi —— Typecho 评论 / 文章 / 图片管理 API（Token 鉴权）
+# MuseApi —— Typecho 评论 / 文章 / 图片 / 视频管理 API（Token 鉴权）
 
 给 Muse（或其他可信客户端）用的最小化管理接口，让 Typecho 博客
-能像 WordPress 那样走 API 托管评论、文章和图片上传。
+能像 WordPress 那样走 API 托管评论、文章、图片和视频上传。
 
-- **只做三件事**：管理评论、管理文章、上传图片。编辑级权限。
-- **不做**：用户管理、设置修改、链接、主题/插件、备份、除图片上传外
+- **只做四件事**：管理评论、管理文章、上传图片、上传视频。编辑级权限。
+- **不做**：用户管理、设置修改、链接、主题/插件、备份、除图片/视频上传外
   的文件操作。
-- **v1.1 没有删除文章接口**：删文章请在后台手动操作（见下方说明）。
+- **v1.2 没有删除文章接口**：删文章请在后台手动操作（见下方说明）。
 - **鉴权**：静态 Token，放在 `X-Muse-Token` 请求头里（不在 URL 里传）。
 - **要求**：Typecho 1.3.0，PHP 8.1+（代码用了 PHP 8.1 的 `never` 返回类型）。
 
@@ -31,7 +31,7 @@
 
 接口地址：`POST https://your-blog.example/index.php/action/muse-api`
 
-> **从 v1.1 升级到 v1.1.1**：直接用新版 `Plugin.php`、`Action.php`
+> **从 v1.1.1 升级到 v1.2.0**：直接用新版 `Plugin.php`、`Action.php`
 > 覆盖 `usr/plugins/MuseApi/` 下的同名文件即可，**不需要停用再启用**，
 > Token 存在数据库配置里、不会变，接口路由也没有变。
 > （停用会删配置、重新启用会换 Token，只有换 Token 时才需要停用。）
@@ -39,7 +39,14 @@
 > **版本历史**：v1.1.0 增加了 `upload_image`；v1.1.1 修复了上传
 > 的 MIME 检测——有的服务器 fileinfo 的 magic 库损坏，会把所有文件
 > 都认成 `application/octet-stream`，导致真图片也被拒绝，v1.1.1
-> 在这种情况下改用 `getimagesize()` + 文件头特征码二次核对。
+> 在这种情况下改用 `getimagesize()` + 文件头特征码二次核对；
+> v1.2.0 增加了 `upload_video`，并把上传改成通用设计：图片与视频
+> 共用同一个上传处理（格式表 + 上限是唯一的扩展点），图片支持
+> jpg/jpeg/png/gif/webp/avif/bmp（10MB），视频支持 mp4/m4v/mov/webm/
+> mkv/avi/flv/wmv（100MB）。fileinfo 损坏时图片按 `getimagesize()` +
+> 文件头特征码兜底，视频按文件头特征码（ftyp/EBML/RIFF-AVI/FLV/
+> ASF GUID）兜底。注意 Typecho 核心还会按站点附件类型白名单过滤，
+> 见「图片/视频上传接口」一节的说明。
 
 ## Token 管理
 
@@ -72,8 +79,8 @@ X-Muse-Token: <Token>
 {"success": false, "error": "Token 无效", "code": "unauthorized"}
 ```
 
-> `upload_image` 是唯一的例外：它用 `multipart/form-data`（见
-> 「图片上传接口」一节），其余 12 个接口都用 JSON。
+> `upload_image` / `upload_video` 是唯一的例外：它们用
+> `multipart/form-data`（见「图片/视频上传接口」一节），其余 12 个接口都用 JSON。
 
 | HTTP 状态 | 含义 |
 | --- | --- |
@@ -237,7 +244,7 @@ X-Muse-Token: <Token>
   标记会被去掉后重加。
 - 不存在返回 404；分类名不存在返回 400。
 
-## 图片上传接口
+## 图片/视频上传接口
 
 ### upload_image —— 上传一张图片
 
@@ -251,7 +258,7 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
 ```
 
 - 表单字段：`action` 固定为 `upload_image`，文件字段名固定为 `file`。
-- 只接受图片：`jpg`、`jpeg`、`png`、`webp`、`gif`。
+- 只接受图片：`jpg`、`jpeg`、`png`、`gif`、`webp`、`avif`、`bmp`。
   按扩展名和实测 MIME 类型双重校验，不信任客户端自报的 MIME；
   文本文件改 `.jpg` 后缀也会被拒绝。
 - 单文件上限 **10 MB**，超过返回 400（`file_too_large`）。
@@ -284,6 +291,52 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
 - `size`：字节数；`mime`：实测 MIME 类型；`type`：扩展名（小写）。
 - 返回的 URL 已按站点配置生成（含子目录/反代前缀等，与后台一致）。
 
+### upload_video —— 上传一个视频
+
+与上传图片同一套 multipart 用法，只换 `action` 和文件类型：
+
+```bash
+curl -X POST "https://your-blog.example/index.php/action/muse-api" \
+  -H "X-Muse-Token: <Token>" \
+  -F "action=upload_video" \
+  -F "file=@/path/to/clip.mp4"
+```
+
+- 表单字段：`action` 固定为 `upload_video`，文件字段名固定为 `file`。
+- 接受的视频格式（扩展名 → 实测 MIME，双重校验）：
+
+  | 扩展名 | MIME | 文件头兜底特征 |
+  | --- | --- | --- |
+  | `mp4`、`m4v` | `video/mp4` | `ftyp` 盒子 |
+  | `mov` | `video/quicktime` | `ftyp` 盒子 |
+  | `webm` | `video/webm` | EBML 头 `1A 45 DF A3` |
+  | `mkv` | `video/x-matroska` | EBML 头 `1A 45 DF A3` |
+  | `avi` | `video/x-msvideo` | `RIFF` + `AVI␣` |
+  | `flv` | `video/x-flv` | `FLV` 头 |
+  | `wmv` | `video/x-ms-asf` | ASF GUID |
+
+  文本文件改 `.mp4` 后缀也会被拒绝。fileinfo 损坏时（返回
+  `application/octet-stream`）改按上表的文件头特征码二次核对。
+  注意：fileinfo 把 wmv 认作 ASF 容器类型 `video/x-ms-asf`
+  （不是 `video/x-ms-wmv`），格式表里按 fileinfo 的返回值写。
+- **注意站点的附件类型白名单**：Typecho 核心上传时会再按
+  「设置 → 附件 → 允许上传的文件类型」过滤一次。默认只开
+  `@image@`（jpg/jpeg/png/gif/webp/bmp/tiff），视频要先在设置里
+  勾上 `@media@`（mp4/mov/wmv/avi/flv）或在「其他」里补写扩展名；
+  `avif`、`m4v`、`webm`、`mkv` 不在两个默认分组里，必须在设置里
+  手动加上，否则上传会报 500（`upload_failed`）。本插件不替你改
+  这个设置——它是站点级的安全开关。
+- 单文件上限 **100 MB**，超过返回 400（`file_too_large`）。
+  注意服务器自身的限制也会先生效：PHP 的 `upload_max_filesize` /
+  `post_max_size` 和 nginx 的 `client_max_body_size` 若小于文件，
+  请求在到插件之前就被拦下（此时报错里会带上服务器的这两个 PHP
+  配置值，见下表 `file_too_large` 一行）。
+- 存储与上传图片同一条核心路径：存入 `usr/uploads/YYYY/MM/`，
+  文件名由核心生成，同时在内容表里生成一条 `attachment` 记录，
+  媒体库可见。成功响应与上传图片同形（`attachment` 里 `mime` 为
+  `video/mp4`、`type` 为 `mp4`），返回的 URL 可直接写进文章正文
+  （如 dplayer 播放器的视频地址）。
+
 错误分支（与其它接口同一错误格式）：
 
 | HTTP 状态 | code | 含义 |
@@ -291,21 +344,21 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
 | 401 | `unauthorized` | 缺少或错误的 Token（鉴权先于文件校验，无 Token 时即使文件非法也先报 401） |
 | 400 | `missing_file` | 没有传 `file` 字段 |
 | 400 | `upload_error` | 上传本身出错（PHP 上传错误码） |
-| 400 | `file_too_large` | 文件超过 10MB |
+| 400 | `file_too_large` | 文件超过上限（图片 10MB、视频 100MB）；若是服务器 PHP 限制先拦下，报错文本里会带上 `upload_max_filesize` / `post_max_size` 的实际值 |
 | 400 | `bad_file_type` | 扩展名不在白名单，或实测 MIME 与扩展名不符 |
-| 400 | `bad_request` | multipart 请求的 `action` 不是 `upload_image`（multipart 只支持上传） |
+| 400 | `bad_request` | multipart 请求的 `action` 不是 `upload_image` / `upload_video`（multipart 只支持上传） |
 | 500 | `upload_failed` | 核心上传失败（如该类型不在站点允许的附件类型里） |
 
-注意：JSON 请求体里发 `upload_image` 会报 400（`unknown_action`），
-因为它不在 JSON 分发表里——必须用 multipart。
+注意：JSON 请求体里发 `upload_image` / `upload_video` 会报 400
+（`unknown_action`），因为它们不在 JSON 分发表里——必须用 multipart。
 
-## 明确不做的事（v1.1）
+## 明确不做的事（v1.2）
 
 - **删除文章**：没有 `delete_post`。删文章请在后台手动操作。
-  （评论删除有接口；文章删除一旦误操作不可恢复，故 v1.1 不提供。）
+  （评论删除有接口；文章删除一旦误操作不可恢复，故 v1.2 不提供。）
 - **页面（page）**：只管文章（post / post_draft），不管页面。
-- **用户、设置、链接、主题/插件、备份、除图片上传外的文件操作**：
-  一律没有接口。图片上传是 v1.1 新增的唯一文件操作。
+- **用户、设置、链接、主题/插件、备份、除图片/视频上传外的文件操作**：
+  一律没有接口。图片/视频上传是唯一的文件操作（图片 v1.1、视频 v1.2 新增）。
 - **自动创建分类**：分类名不存在时报 400，请先在后台建好分类。
 
 ## 实现说明
@@ -331,12 +384,26 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
   `Widget\Contents\From` 逐篇取计算字段（链接、分类、标签）。
 - 评论列表用 `Widget\Comments\Admin`；`status=all` 时合并三类结果
   再按 coid 倒序分页（核心组件没有“全部”筛选）。
-- 图片上传走核心 `Widget\Upload::uploadHandle()`（即后台上传同一条
+- 图片/视频上传走核心 `Widget\Upload::uploadHandle()`（即后台上传同一条
   路：文件名清洗、扩展名校验、按年月分目录、随机命名、移动文件），
-  再用 `Widget\Upload::insert()` 写附件记录。入口按 `Content-Type`
-  分流：`multipart/form-data` 只认 `upload_image`，JSON 只走原有
-  12 个接口，两边互不干扰。鉴权顺序与 JSON 路径一致（先验 Token、
-  再登录 API 用户），文件校验在鉴权之后。
+  再用 `Widget\Upload::insert()` 写附件记录。图片与视频共用同一个
+  上传处理 `uploadFile()`：格式表（`IMAGE_MIME_BY_EXT` /
+  `VIDEO_MIME_BY_EXT`）+ 上限是唯一的扩展点——`upload_image` /
+  `upload_video` 只是传不同格式表和上限的薄壳，加格式只改表，
+  不用加新接口。入口按 `Content-Type`
+  分流：`multipart/form-data` 只认 `upload_image` / `upload_video`，
+  JSON 只走原有 12 个接口，两边互不干扰。鉴权顺序与 JSON 路径一致
+  （先验 Token、再登录 API 用户），文件校验在鉴权之后。
+  图片的 MIME 兜底先走 `getimagesize()` 再按文件头特征码；
+  视频的 MIME 兜底不走 `getimagesize()`（只认图片），直接按文件头
+  特征码判断容器族（ftyp/EBML/RIFF-AVI/FLV/ASF GUID）。
+- 核心上传还会按站点附件类型白名单过滤一次：`Upload::uploadHandle()`
+  里 `checkFileType()` 查 `allowedAttachmentTypes`（即「设置 → 附件 →
+  允许上传的文件类型」，`@image@` 展开为 gif/jpg/jpeg/png/tiff/bmp/webp，
+  `@media@` 展开为 mp3/mp4/mov/wmv/wma/rmvb/rm/avi/flv/ogg/oga/ogv，
+  默认只开 `@image@`）。不在白名单里的格式会让核心上传返回失败，
+  本插件报 500（`upload_failed`）；`avif`、`m4v`、`webm`、`mkv`
+  不在两个默认分组里，须在设置里手动加上，见上一节。
 - 与写文章相同的沙箱异常问题也适用于上传：`insert()` 的异常在回调
   内捕获、回调外重新抛出，入库失败时删除已移动的文件，成功后重新
   查库核对附件行（类型与存储路径一致）再返回。
@@ -371,6 +438,25 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
 - **v1.1.1 补测**（同一本地环境）：模拟 fileinfo 损坏（强制返回
   `application/octet-stream`）后，真 JPEG/PNG/GIF/WebP 仍可上传成功，
   文本冒充 `.jpg` 仍被拒绝；正常路径的上传与回归接口均不受影响。
+- **v1.2 新增的上传冒烟测试**（同一本地环境，36 项全过）：先验证
+  Typecho 核心白名单——默认只开 `@image@` 时 mp4 上传报 500
+  （`upload_failed`，核心 `checkFileType()` 拦截），图片仍可传；
+  在测试站设置里放行 `@media@` + m4v/webm/mkv/avif 后，mp4/mov/webm/
+  mkv/avi/flv/wmv/m4v 全部上传成功（返回的 MIME 与格式表一致，URL
+  可直接 GET 200），同名 mp4 两次上传得到不同存储名；bmp/avif
+  上传成功（avif 由 ffmpeg 生成）。错误分支全过：无 Token/错 Token
+  → 401；`.txt`、文本冒充 `.mp4` → 400 `bad_file_type`；缺 `file`
+  字段 → 400 `missing_file`；multipart 发 `list_comments` → 400
+  `bad_request`；GET → 405；JSON 发 `upload_video` → 400
+  `unknown_action`。模拟 fileinfo 损坏后，真 mp4（ftyp 兜底）、
+  真 webm（EBML 兜底）、真 bmp 仍可上传成功，假 `.mp4`/`.webm`
+  仍被拒绝。101MB 的假 mp4 → 400 `file_too_large`（插件 100MB
+  上限，报错“视频超过 100MB 上限”）；把服务器 `upload_max_filesize`
+  改成 8M 后再传同一文件 → 400 `file_too_large`，报错里带上
+  `upload_max_filesize=8M`。回归：JPEG/PNG 上传、`list_comments`、
+  `list_posts`、新建草稿均正常。测试中发现并修复一个真实问题：
+  fileinfo 把 wmv 认作 `video/x-ms-asf`（不是 `video/x-ms-wmv`），
+  格式表已按 fileinfo 的返回值写。
 - 已在真实站点上安装 v1.1.0 并验证：只读接口正常，Token 有效；
   但线上站的 fileinfo 会把真图片认成 `application/octet-stream`，
   导致 v1.1.0 的上传被拒——v1.1.1 已针对性修复，升级后请再试传一张。
