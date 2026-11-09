@@ -1,12 +1,14 @@
-# MuseApi —— Typecho 评论 / 文章 / 图片 / 视频管理 API（Token 鉴权）
+# MuseApi —— Typecho 评论 / 文章 / 图片 / 视频 / 文件删除管理 API（Token 鉴权）
 
 给 Muse（或其他可信客户端）用的最小化管理接口，让 Typecho 博客
-能像 WordPress 那样走 API 托管评论、文章、图片和视频上传。
+能像 WordPress 那样走 API 托管评论、文章、图片和视频上传，
+以及删除 uploads 内的旧文件。
 
-- **只做四件事**：管理评论、管理文章、上传图片、上传视频。编辑级权限。
-- **不做**：用户管理、设置修改、链接、主题/插件、备份、除图片/视频上传外
-  的文件操作。
-- **v1.2 没有删除文章接口**：删文章请在后台手动操作（见下方说明）。
+- **只做五件事**：管理评论、管理文章、上传图片、上传视频、删除
+  `usr/uploads/` 内的文件。编辑级权限。
+- **不做**：用户管理、设置修改、链接、主题/插件、备份、除图片/视频上传
+  与 `delete_file` 删除外的文件操作。
+- **v1.3 没有删除文章接口**：删文章请在后台手动操作（见下方说明）。
 - **鉴权**：静态 Token，放在 `X-Muse-Token` 请求头里（不在 URL 里传）。
 - **要求**：Typecho 1.3.0，PHP 8.1+（代码用了 PHP 8.1 的 `never` 返回类型）。
 
@@ -31,10 +33,11 @@
 
 接口地址：`POST https://your-blog.example/index.php/action/muse-api`
 
-> **从 v1.1.1 升级到 v1.2.0**：直接用新版 `Plugin.php`、`Action.php`
+> **从 v1.2.0 升级到 v1.3.0**：直接用新版 `Plugin.php`、`Action.php`
 > 覆盖 `usr/plugins/MuseApi/` 下的同名文件即可，**不需要停用再启用**，
 > Token 存在数据库配置里、不会变，接口路由也没有变。
 > （停用会删配置、重新启用会换 Token，只有换 Token 时才需要停用。）
+> 之前从 v1.1.1 升 v1.2.0 也是同样做法。
 
 > **版本历史**：v1.1.0 增加了 `upload_image`；v1.1.1 修复了上传
 > 的 MIME 检测——有的服务器 fileinfo 的 magic 库损坏，会把所有文件
@@ -47,6 +50,9 @@
 > 文件头特征码兜底，视频按文件头特征码（ftyp/EBML/RIFF-AVI/FLV/
 > ASF GUID）兜底。注意 Typecho 核心还会按站点附件类型白名单过滤，
 > 见「图片/视频上传接口」一节的说明。
+> v1.3.0 增加了 `delete_file`：删除 `usr/uploads/` 内的一个文件，
+> 删文件时一并清掉内容表里路径相同的 attachment 记录；路径穿越、
+> 符号链接逃逸、目录一律拒绝，见「文件删除接口」一节。
 
 ## Token 管理
 
@@ -80,16 +86,16 @@ X-Muse-Token: <Token>
 ```
 
 > `upload_image` / `upload_video` 是唯一的例外：它们用
-> `multipart/form-data`（见「图片/视频上传接口」一节），其余 12 个接口都用 JSON。
+> `multipart/form-data`（见「图片/视频上传接口」一节），其余 13 个接口都用 JSON。
 
 | HTTP 状态 | 含义 |
 | --- | --- |
-| 400 | 请求体不是 JSON 对象、未知的 action、参数不合法；上传时文件缺失、类型不符、超过 10MB 也属此类 |
+| 400 | 请求体不是 JSON 对象、未知的 action、参数不合法；上传时文件缺失、类型不符、超过 10MB 也属此类；`delete_file` 时路径越界、传了目录也属此类 |
 | 401 | 缺少 `X-Muse-Token` 请求头，或 Token 错误 |
 | 403 | 无权操作（核心组件报的权限问题） |
-| 404 | 文章/评论不存在 |
+| 404 | 文章/评论/文件不存在 |
 | 405 | 不是 POST 请求 |
-| 500 | 插件未配置 Token、API 用户不存在/权限不足、服务器内部错误 |
+| 500 | 插件未配置 Token、API 用户不存在/权限不足、服务器内部错误；`delete_file` 时 `unlink()` 失败也属此类 |
 
 ## 评论接口
 
@@ -352,13 +358,54 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
 注意：JSON 请求体里发 `upload_image` / `upload_video` 会报 400
 （`unknown_action`），因为它们不在 JSON 分发表里——必须用 multipart。
 
-## 明确不做的事（v1.2）
+## 文件删除接口
+
+### delete_file —— 删除 uploads 内的一个文件
+
+```json
+{"action": "delete_file", "path": "usr/uploads/2026/03/xxx.jpg"}
+```
+
+- `path`：要删的文件在站内的相对路径，可带可不带开头的斜杠
+  （`usr/uploads/2026/03/xxx.jpg` 与 `/usr/uploads/2026/03/xxx.jpg`
+  一样）。**只能删 `usr/uploads/` 内的普通文件**，这是硬性边界：
+  - 路径里有 `..`、或解析后不在 `usr/uploads/` 内 → 400（`bad_path`），
+    如 `../config.inc.php`、`/etc/passwd`、`usr/uploads/../config.inc.php`；
+  - 父目录或文件本身是符号链接、解析后落在 uploads 外 → 400（`bad_path`），
+    目标文件原封不动；
+  - 传了目录（如 `usr/uploads/2026/03`）→ 400（`bad_path`），
+    目录删不掉，只能一个一个删文件；
+  - 文件不存在 → 404（`file_not_found`）。
+- 删文件成功后，再清掉内容表里路径相同的 `attachment` 记录（如果有），
+  这样媒体库里不会留下指向已删文件的孤儿记录。返回里的
+  `attachment_deleted` 说明有没有清掉这样一条记录（`true`/`false`），
+  没有记录也不算失败——文件删掉了就是成功。
+- 删除是**不可逆**的，没有回收站，调用前请确认路径和备份。
+
+成功响应（HTTP 200）：
+
+```json
+{"success": true, "path": "usr/uploads/2026/03/xxx.jpg", "deleted": true, "attachment_deleted": true}
+```
+
+错误分支：
+
+| HTTP 状态 | code | 含义 |
+| --- | --- | --- |
+| 401 | `unauthorized` | 缺少或错误的 Token（鉴权先于路径校验，无 Token 时即使路径非法也先报 401） |
+| 400 | `bad_path` | 路径为空、含 `..`、不在 `usr/uploads/` 内、符号链接逃逸、或是目录 |
+| 400 | `missing_param` | 没有传 `path` 参数 |
+| 404 | `file_not_found` | 文件不存在 |
+| 500 | `delete_failed` | `unlink()` 失败（如权限不足） |
+
+## 明确不做的事（v1.3）
 
 - **删除文章**：没有 `delete_post`。删文章请在后台手动操作。
-  （评论删除有接口；文章删除一旦误操作不可恢复，故 v1.2 不提供。）
+  （评论删除有接口；文章删除一旦误操作不可恢复，故 v1.3 不提供。）
 - **页面（page）**：只管文章（post / post_draft），不管页面。
-- **用户、设置、链接、主题/插件、备份、除图片/视频上传外的文件操作**：
-  一律没有接口。图片/视频上传是唯一的文件操作（图片 v1.1、视频 v1.2 新增）。
+- **用户、设置、链接、主题/插件、备份、除图片/视频上传与 `delete_file`
+  删除外的文件操作**：一律没有接口。`delete_file` 是唯一的文件删除
+  接口，只限 `usr/uploads/` 内，不能删站内其他文件、不能删目录。
 - **自动创建分类**：分类名不存在时报 400，请先在后台建好分类。
 
 ## 实现说明
@@ -392,7 +439,7 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
   `upload_video` 只是传不同格式表和上限的薄壳，加格式只改表，
   不用加新接口。入口按 `Content-Type`
   分流：`multipart/form-data` 只认 `upload_image` / `upload_video`，
-  JSON 只走原有 12 个接口，两边互不干扰。鉴权顺序与 JSON 路径一致
+  JSON 只走原有 13 个接口，两边互不干扰。鉴权顺序与 JSON 路径一致
   （先验 Token、再登录 API 用户），文件校验在鉴权之后。
   图片的 MIME 兜底先走 `getimagesize()` 再按文件头特征码；
   视频的 MIME 兜底不走 `getimagesize()`（只认图片），直接按文件头
@@ -407,6 +454,18 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
 - 与写文章相同的沙箱异常问题也适用于上传：`insert()` 的异常在回调
   内捕获、回调外重新抛出，入库失败时删除已移动的文件，成功后重新
   查库核对附件行（类型与存储路径一致）再返回。
+- 删除文件 `delete_file` 是 JSON 动作（不是 multipart），走同一张
+  JSON 分发表，鉴权与登录 API 用户在分发前已完成。路径守卫分四层：
+  先按段检查（`..` 直接拒、`.` 与空段折叠、去斜杠后必须以
+  `usr/uploads/` 开头）；再用 `realpath()` 核对父目录的真实路径在
+  uploads 真实目录内（挡住父目录里的符号链接逃逸）；目标本身是
+  符号链接时再核对一次解析后的真实路径；最后只删普通文件，目录、
+  不存在的文件分别报 400 / 404。删文件用 `unlink()`，失败报 500。
+  删完再扫内容表里 `type='attachment'` 的行：`text` 字段先按 JSON
+  解（Typecho 1.3.0 核心与本插件都写 JSON），解不出再按 PHP 序列化
+  解，路径（去掉开头斜杠后）与删除路径相同的行删掉；没有匹配行
+  也不算失败。注意：附件行的 `text` 在 Typecho 1.3.0 里是 JSON，
+  不是 `unserialize()`——双解码只是为了兼容老版本核心的写法。
 
 ## 测试
 
@@ -457,6 +516,21 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
   `list_posts`、新建草稿均正常。测试中发现并修复一个真实问题：
   fileinfo 把 wmv 认作 `video/x-ms-asf`（不是 `video/x-ms-wmv`），
   格式表已按 fileinfo 的返回值写。
+- **v1.3 新增的删除冒烟测试**（同一本地环境，全新安装，脚本
+  `/tmp/test13.sh`，**47 项全过**）：先上传一张图再 `delete_file`
+  它 → 200，磁盘文件消失，附件行消失（`attachment_deleted: true`）；
+  手工放一个无附件记录的文件（带开头斜杠的路径形式）→ 200，
+  `attachment_deleted: false`；手工插一条 PHP 序列化 `text` 的附件
+  行再删 → 200，`attachment_deleted: true`（双解码分支已验证）；
+  不存在的文件 → 404（`file_not_found`，含父目录不存在的情况）；
+  穿越/逃逸全部 400（`bad_path`）且目标原封不动：`../config.inc.php`、
+  `/etc/passwd`、`usr/uploads/../config.inc.php`、绝对路径
+  `/tmp/evil.txt`、uploads 内的符号链接（指向站外）、符号链接
+  目录下的文件、双重 `..`；传目录（`usr/uploads/2026/03`、
+  `usr/uploads`）与空路径 → 400；错 Token + 穿越路径 → 401
+  （鉴权先于路径校验），无 Token → 401。回归：JPEG 上传、
+  `list_comments`、`list_posts`、新建草稿均正常。测试中没有发现
+  需要修的 bug。
 - 已在真实站点上安装 v1.1.0 并验证：只读接口正常，Token 有效；
   但线上站的 fileinfo 会把真图片认成 `application/octet-stream`，
   导致 v1.1.0 的上传被拒——v1.1.1 已针对性修复，升级后请再试传一张。

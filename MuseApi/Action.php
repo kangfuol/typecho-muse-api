@@ -3,9 +3,11 @@
  * MuseApi 的 Action：POST /index.php/action/muse-api
  *
  * 请求：POST，请求头 X-Muse-Token: <Token>。
- *   - 评论/文章 12 个动作：JSON 请求体 {"action": "list_comments", ...}。
+ *   - 评论/文章 13 个动作：JSON 请求体 {"action": "list_comments", ...}。
  *   - 上传图片 upload_image / 上传视频 upload_video：multipart/form-data，
  *     字段 action=upload_image 或 upload_video，文件字段 file。
+ *   - 删除文件 delete_file：JSON 请求体 {"action": "delete_file",
+ *     "path": "usr/uploads/2026/03/xxx.jpg"}，只限 uploads 目录内。
  * 响应：JSON，成功 {"success": true, ...}，失败 {"success": false, "error": "...", "code": "..."}。
  *
  * 鉴权后以配置的 API 用户（默认 muse，须为编辑或管理员）临时登录
@@ -48,9 +50,10 @@ class Action extends Base implements ActionInterface
 {
     /**
      * JSON 动作分发表：请求里的 action 名 => 本类方法名
-     * （只做评论和文章；没有用户/设置/链接/主题插件/备份操作，
-     *  也没有删除文章接口。upload_image / upload_video 是 multipart 请求，
-     *  不走这张表，见 handleMultipart()。）
+     * （评论、文章与删除文件；没有用户/设置/链接/主题插件/备份操作，
+     *  也没有删除文章接口。delete_file 是唯一的删除文件接口，
+     *  只限 usr/uploads/ 内。upload_image / upload_video 是
+     *  multipart 请求，不走这张表，见 handleMultipart()。）
      */
     private const DISPATCH = [
         'list_comments'   => 'listComments',
@@ -65,6 +68,7 @@ class Action extends Base implements ActionInterface
         'get_post'        => 'getPost',
         'create_post'     => 'createPost',
         'update_post'     => 'updatePost',
+        'delete_file'     => 'deleteFile',
     ];
 
     /** 评论状态（数据库里的值） */
@@ -138,7 +142,7 @@ class Action extends Base implements ActionInterface
         }
 
         // multipart/form-data 只走文件上传分支（upload_image / upload_video）；
-        // 其余 12 个动作一律走下面的 JSON 分发，不动。
+        // 其余 13 个动作一律走下面的 JSON 分发，不动。
         $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
 
         if (str_starts_with(strtolower(trim($contentType)), 'multipart/form-data')) {
@@ -569,6 +573,209 @@ class Action extends Base implements ActionInterface
         }
 
         return '';
+    }
+
+    // ------------------------------------------------------------------
+    // 文件删除（JSON）
+    // ------------------------------------------------------------------
+
+    /**
+     * 删除 uploads 目录内的一个文件：
+     * {"action": "delete_file", "path": "usr/uploads/2026/03/xxx.jpg"}
+     *
+     * path 可带可不带开头的斜杠。删文件成功后，再清掉内容表里路径
+     * 相同的 attachment 记录（如果有），这样媒体库里也不会留下
+     * 指向已删文件的孤儿记录。鉴权在分发前已完成（handle() 里
+     * authenticate() + loginApiUser()），无 Token / 错 Token 在
+     * 路径校验之前就报 401。
+     */
+    private function deleteFile(array $params): void
+    {
+        $path = $this->reqString($params, 'path', 1024, true);
+        $resolved = $this->resolveUploadPath($path);
+        $fullPath = $resolved['full'];
+        $relPath = $resolved['rel'];
+
+        if (!file_exists($fullPath)) {
+            $this->fail('文件不存在：' . $relPath, 404, 'file_not_found');
+        }
+
+        if (is_dir($fullPath)) {
+            $this->fail('只能删除文件，不能删除目录：' . $relPath, 400, 'bad_path');
+        }
+
+        if (!is_file($fullPath)) {
+            $this->fail('只能删除普通文件：' . $relPath, 400, 'bad_path');
+        }
+
+        if (!@unlink($fullPath)) {
+            $this->fail('删除文件失败：' . $relPath, 500, 'delete_failed');
+        }
+
+        $attachmentDeleted = $this->deleteAttachmentRow($relPath);
+
+        $this->ok([
+            'path'               => $relPath,
+            'deleted'            => true,
+            'attachment_deleted' => $attachmentDeleted,
+        ]);
+    }
+
+    /**
+     * 站点的 uploads 目录绝对路径（与核心 Upload::uploadHandle() 同款取值）。
+     */
+    private function uploadsRoot(): string
+    {
+        $dir = defined('__TYPECHO_UPLOAD_DIR__') ? (string)__TYPECHO_UPLOAD_DIR__ : Upload::UPLOAD_DIR;
+        $root = defined('__TYPECHO_UPLOAD_ROOT_DIR__') ? (string)__TYPECHO_UPLOAD_ROOT_DIR__ : __TYPECHO_ROOT_DIR__;
+
+        return rtrim($root . '/' . ltrim($dir, '/'), '/');
+    }
+
+    /**
+     * 路径 $path 是否在目录 $dir 内（等于目录本身也算在内）。
+     */
+    private function isWithin(string $path, string $dir): bool
+    {
+        $dir = rtrim($dir, '/');
+
+        return $path === $dir || str_starts_with($path, $dir . '/');
+    }
+
+    /**
+     * 把用户传的 path 解析为 uploads 目录内的绝对路径。
+     *
+     * 任一条不满足就直接 fail 400 bad_path：
+     *   - 去掉开头的斜杠后，必须以 usr/uploads/ 开头（或就是 usr/uploads，
+     *     那是目录，交给调用方报 400）；
+     *   - 任何一段都不能是 ..（. 与空段统一折叠掉）；
+     *   - 父目录解析后的真实路径必须在 uploads 真实目录内
+     *     （挡住父目录里的符号链接逃逸）；
+     *   - 目标本身是符号链接时，解析后的真实路径也必须在
+     *     uploads 内（挡住文件级符号链接逃逸）。
+     *
+     * 返回 ['full' => 绝对路径, 'rel' => 不带开头斜杠的规范路径]。
+     * 父目录不存在时 realpath 失败——这种情况文件一定不存在，
+     * 这里不 fail，交给调用方报 404。
+     */
+    private function resolveUploadPath(string $path): array
+    {
+        $trimmed = trim($path);
+
+        if ('' === $trimmed) {
+            $this->fail('path 不能为空', 400, 'bad_path');
+        }
+
+        // 允许带开头的斜杠；反斜杠在 Linux 文件名里是普通字符，
+        // 但为防 Windows 风格的穿越写法，同样按分隔符处理。
+        $trimmed = ltrim(str_replace('\\', '/', $trimmed), '/');
+
+        $segments = [];
+
+        foreach (explode('/', $trimmed) as $segment) {
+            if ('..' === $segment) {
+                $this->fail('path 不能包含 ..：' . $path, 400, 'bad_path');
+            }
+
+            if ('' === $segment || '.' === $segment) {
+                continue;
+            }
+
+            $segments[] = $segment;
+        }
+
+        $normalized = implode('/', $segments);
+
+        if ('usr/uploads' !== $normalized && !str_starts_with($normalized, 'usr/uploads/')) {
+            $this->fail('只能删除 usr/uploads/ 内的文件：' . $path, 400, 'bad_path');
+        }
+
+        $uploadsRoot = $this->uploadsRoot();
+        $inner = ltrim(substr($normalized, strlen('usr/uploads')), '/');
+        $fullPath = $uploadsRoot . ('' === $inner ? '' : '/' . $inner);
+
+        $uploadsReal = realpath($uploadsRoot);
+
+        if (false === $uploadsReal) {
+            // uploads 目录本身不存在：任何文件都不存在，交给调用方报 404。
+            return ['full' => $fullPath, 'rel' => $normalized];
+        }
+
+        $parentReal = realpath(dirname($fullPath));
+
+        if (is_string($parentReal) && !$this->isWithin($parentReal, $uploadsReal)) {
+            $this->fail('path 超出 usr/uploads/ 范围：' . $path, 400, 'bad_path');
+        }
+
+        // 目标本身是符号链接时，解析后的真实路径也必须在 uploads 内。
+        if (is_link($fullPath)) {
+            $targetReal = realpath($fullPath);
+
+            if (false === $targetReal) {
+                // 悬空链接：目标不存在，交给调用方报 404。
+                return ['full' => $fullPath, 'rel' => $normalized];
+            }
+
+            if (!$this->isWithin($targetReal, $uploadsReal)) {
+                $this->fail('path 超出 usr/uploads/ 范围：' . $path, 400, 'bad_path');
+            }
+        }
+
+        return ['full' => $fullPath, 'rel' => $normalized];
+    }
+
+    /**
+     * 清掉内容表里路径相同的 attachment 记录（如果有）。
+     *
+     * 附件行的 text 字段存的是上传结果数组：Typecho 1.3.0 核心与本插件
+     * 都写 JSON，解码时再兼容一手 PHP 序列化串（老版本核心的写法）。
+     * 存储的 path 可能带开头的斜杠，比较时统一去掉。
+     *
+     * @return bool 是否删掉至少一行
+     */
+    private function deleteAttachmentRow(string $relPath): bool
+    {
+        $rows = $this->db->fetchAll($this->db->select('cid', 'text')
+            ->from('table.contents')->where('type = ?', 'attachment'));
+
+        $deleted = false;
+
+        foreach ($rows as $row) {
+            $stored = $this->decodeAttachmentText((string)($row['text'] ?? ''));
+
+            if (!is_array($stored)) {
+                continue;
+            }
+
+            $storedPath = ltrim((string)($stored['path'] ?? ''), '/');
+
+            if ('' === $storedPath || $storedPath !== $relPath) {
+                continue;
+            }
+
+            $this->db->query($this->db->delete('table.contents')
+                ->where('cid = ?', (int)$row['cid']));
+            $deleted = true;
+        }
+
+        return $deleted;
+    }
+
+    /**
+     * 解析附件行 text 字段：先试 JSON（Typecho 1.3.0 核心与本插件的
+     * 写法），再试 PHP 序列化，都解不出返回 null。
+     */
+    private function decodeAttachmentText(string $text): ?array
+    {
+        $decoded = json_decode($text, true);
+
+        if (is_array($decoded)) {
+            return $decoded;
+        }
+
+        $unserialized = @unserialize($text);
+
+        return is_array($unserialized) ? $unserialized : null;
     }
 
     // ------------------------------------------------------------------
