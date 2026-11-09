@@ -1,11 +1,12 @@
-# MuseApi —— Typecho 评论 / 文章管理 API（Token 鉴权）
+# MuseApi —— Typecho 评论 / 文章 / 图片管理 API（Token 鉴权）
 
 给 Muse（或其他可信客户端）用的最小化管理接口，让 Typecho 博客
-能像 WordPress 那样走 API 托管评论和文章。
+能像 WordPress 那样走 API 托管评论、文章和图片上传。
 
-- **只做两件事**：管理评论、管理文章。编辑级权限。
-- **不做**：用户管理、设置修改、链接、主题/插件、备份、文件操作。
-- **v1 没有删除文章接口**：删文章请在后台手动操作（见下方说明）。
+- **只做三件事**：管理评论、管理文章、上传图片。编辑级权限。
+- **不做**：用户管理、设置修改、链接、主题/插件、备份、除图片上传外
+  的文件操作。
+- **v1.1 没有删除文章接口**：删文章请在后台手动操作（见下方说明）。
 - **鉴权**：静态 Token，放在 `X-Muse-Token` 请求头里（不在 URL 里传）。
 - **要求**：Typecho 1.3.0，PHP 8.1+（代码用了 PHP 8.1 的 `never` 返回类型）。
 
@@ -22,6 +23,11 @@
    操作，该用户必须是编辑或管理员。
 
 接口地址：`POST https://your-blog.example/index.php/action/muse-api`
+
+> **从 v1.0 升级到 v1.1**：直接用新版 `Plugin.php`、`Action.php`
+> 覆盖 `usr/plugins/MuseApi/` 下的同名文件即可，**不需要停用再启用**，
+> Token 存在数据库配置里、不会变，接口路由也没有变。
+> （停用会删配置、重新启用会换 Token，只有换 Token 时才需要停用。）
 
 ## Token 管理
 
@@ -54,9 +60,12 @@ X-Muse-Token: <Token>
 {"success": false, "error": "Token 无效", "code": "unauthorized"}
 ```
 
+> `upload_image` 是唯一的例外：它用 `multipart/form-data`（见
+> 「图片上传接口」一节），其余 12 个接口都用 JSON。
+
 | HTTP 状态 | 含义 |
 | --- | --- |
-| 400 | 请求体不是 JSON 对象、未知的 action、参数不合法 |
+| 400 | 请求体不是 JSON 对象、未知的 action、参数不合法；上传时文件缺失、类型不符、超过 10MB 也属此类 |
 | 401 | 缺少 `X-Muse-Token` 请求头，或 Token 错误 |
 | 403 | 无权操作（核心组件报的权限问题） |
 | 404 | 文章/评论不存在 |
@@ -216,12 +225,75 @@ X-Muse-Token: <Token>
   标记会被去掉后重加。
 - 不存在返回 404；分类名不存在返回 400。
 
-## 明确不做的事（v1）
+## 图片上传接口
+
+### upload_image —— 上传一张图片
+
+与其他接口不同，这个接口用 `multipart/form-data`，不要发 JSON：
+
+```bash
+curl -X POST "https://your-blog.example/index.php/action/muse-api" \
+  -H "X-Muse-Token: <Token>" \
+  -F "action=upload_image" \
+  -F "file=@/path/to/photo.jpg"
+```
+
+- 表单字段：`action` 固定为 `upload_image`，文件字段名固定为 `file`。
+- 只接受图片：`jpg`、`jpeg`、`png`、`webp`、`gif`。
+  按扩展名和实测 MIME 类型双重校验，不信任客户端自报的 MIME；
+  文本文件改 `.jpg` 后缀也会被拒绝。
+- 单文件上限 **10 MB**，超过返回 400（`file_too_large`）。
+- 文件走 Typecho 核心自己的上传路径（`Widget\Upload::uploadHandle`），
+  与后台上传完全一致：存入 `usr/uploads/YYYY/MM/`，文件名由核心生成
+  （crc32 随机数 + 扩展名），同名自动换名不覆盖；同时在内容表里生成一
+  条 `attachment` 记录（标题为原文件名，作者为 API 用户），与后台
+  上传的附件无区别，媒体库可见。
+
+成功响应（HTTP 200）：
+
+```json
+{
+  "success": true,
+  "attachment": {
+    "aid": 123,
+    "url": "https://your-blog.example/usr/uploads/2026/11/4227869332.jpg",
+    "filename": "4227869332.jpg",
+    "originalName": "photo.jpg",
+    "path": "/usr/uploads/2026/11/4227869332.jpg",
+    "size": 8230,
+    "mime": "image/jpeg",
+    "type": "jpg"
+  }
+}
+```
+
+- `aid`：附件在内容表里的 id；`url`：公开可访问的图片地址，
+  可直接写进文章正文（如 `![说明](url)`）。
+- `size`：字节数；`mime`：实测 MIME 类型；`type`：扩展名（小写）。
+- 返回的 URL 已按站点配置生成（含子目录/反代前缀等，与后台一致）。
+
+错误分支（与其它接口同一错误格式）：
+
+| HTTP 状态 | code | 含义 |
+| --- | --- | --- |
+| 401 | `unauthorized` | 缺少或错误的 Token（鉴权先于文件校验，无 Token 时即使文件非法也先报 401） |
+| 400 | `missing_file` | 没有传 `file` 字段 |
+| 400 | `upload_error` | 上传本身出错（PHP 上传错误码） |
+| 400 | `file_too_large` | 文件超过 10MB |
+| 400 | `bad_file_type` | 扩展名不在白名单，或实测 MIME 与扩展名不符 |
+| 400 | `bad_request` | multipart 请求的 `action` 不是 `upload_image`（multipart 只支持上传） |
+| 500 | `upload_failed` | 核心上传失败（如该类型不在站点允许的附件类型里） |
+
+注意：JSON 请求体里发 `upload_image` 会报 400（`unknown_action`），
+因为它不在 JSON 分发表里——必须用 multipart。
+
+## 明确不做的事（v1.1）
 
 - **删除文章**：没有 `delete_post`。删文章请在后台手动操作。
-  （评论删除有接口；文章删除一旦误操作不可恢复，故 v1 不提供。）
+  （评论删除有接口；文章删除一旦误操作不可恢复，故 v1.1 不提供。）
 - **页面（page）**：只管文章（post / post_draft），不管页面。
-- **用户、设置、链接、主题/插件、备份、文件操作**：一律没有接口。
+- **用户、设置、链接、主题/插件、备份、除图片上传外的文件操作**：
+  一律没有接口。图片上传是 v1.1 新增的唯一文件操作。
 - **自动创建分类**：分类名不存在时报 400，请先在后台建好分类。
 
 ## 实现说明
@@ -247,17 +319,44 @@ X-Muse-Token: <Token>
   `Widget\Contents\From` 逐篇取计算字段（链接、分类、标签）。
 - 评论列表用 `Widget\Comments\Admin`；`status=all` 时合并三类结果
   再按 coid 倒序分页（核心组件没有“全部”筛选）。
+- 图片上传走核心 `Widget\Upload::uploadHandle()`（即后台上传同一条
+  路：文件名清洗、扩展名校验、按年月分目录、随机命名、移动文件），
+  再用 `Widget\Upload::insert()` 写附件记录。入口按 `Content-Type`
+  分流：`multipart/form-data` 只认 `upload_image`，JSON 只走原有
+  12 个接口，两边互不干扰。鉴权顺序与 JSON 路径一致（先验 Token、
+  再登录 API 用户），文件校验在鉴权之后。
+- 与写文章相同的沙箱异常问题也适用于上传：`insert()` 的异常在回调
+  内捕获、回调外重新抛出，入库失败时删除已移动的文件，成功后重新
+  查库核对附件行（类型与存储路径一致）再返回。
 
 ## 测试
 
 - `php -l` 语法检查通过（Plugin.php、Action.php）。
 - 在本地 Typecho 1.3.0 + SQLite 全新安装上做过完整冒烟测试
   （非线上站）：激活/停用/重新激活、Token 校验（401）、Token 重新生成
-  （旧 Token 立即失效）、12 个接口全部跑通（含草稿、发布、草稿修订、
+  （旧 Token 立即失效）、13 个接口全部跑通（含草稿、发布、草稿修订、
   密码文章、分类/标签、评论全状态流转、回复、编辑、删除、分页与筛选），
   以及 404/400/405 等错误分支。测试中发现并修复了两个真实问题：
   `Options::plugin()` 返回的是 `Config` 对象不是数组；
   设置表单的 Checkbox 值须用数组，否则 `Request::get()` 会因类型不匹配
   丢弃提交值、导致重新生成失效。
-- 已在真实站点上验证了只读接口和评论删除，安装后请先用只读接口
-  （`list_posts`、`list_comments`）验证，再试写操作。
+- **v1.1 新增的上传冒烟测试**（同一本地环境，`php -S` 以
+  `upload_max_filesize=20M` 启动以便测到插件自己的 10MB 上限）：
+  JPEG/PNG/WebP/GIF 四种格式均上传成功，文件落在
+  `usr/uploads/2026/11/`，返回的 URL 可直接 GET（200，正确
+  Content-Type），附件行 `type=attachment`、`status=publish`、作者为
+  API 用户；同一原文件名两次上传得到不同存储名（核心随机命名，不覆盖）。
+  错误分支全过：无 Token/错 Token → 401（含“无 Token + 非法文件”
+  先报 401，证明鉴权在文件校验之前）；`.txt`、文本冒充 `.jpg` →
+  400 `bad_file_type`；11MB 文件 → 400 `file_too_large`；5.8MB 真实
+  JPEG → 200，14MB 真实 JPEG → 400 `file_too_large`；缺 `file` 字段 →
+  400 `missing_file`；multipart 发 `list_comments` → 400 `bad_request`；
+  GET → 405；JSON 发 `upload_image` → 400 `unknown_action`。
+  回归：`list_comments`、`list_posts`、`create_post`（草稿）、
+  `delete_comment` 均正常；上传后把返回 URL 写进草稿正文再取回也正常。
+  另验证：直接覆盖 `Plugin.php` / `Action.php`（不重启、不停用插件）
+  后同一 Token 继续有效——升级 v1.1 不需要停用再启用。
+- 已在真实站点上验证了只读接口、评论删除和草稿创建；图片上传在本地通过测试，安装后请先用只读接口
+  （`list_posts`、`list_comments`）验证，再试写操作。线上 PHP 的
+  `upload_max_filesize` / `post_max_size` 若小于 10MB，会先于插件
+  拦截大文件（此时报错为 `upload_error`），属服务器配置而非插件问题。

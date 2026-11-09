@@ -2,8 +2,10 @@
 /**
  * MuseApi 的 Action：POST /index.php/action/muse-api
  *
- * 请求：POST，JSON 请求体 {"action": "list_comments", ...}，
- *      请求头 X-Muse-Token: <Token>。
+ * 请求：POST，请求头 X-Muse-Token: <Token>。
+ *   - 评论/文章 12 个动作：JSON 请求体 {"action": "list_comments", ...}。
+ *   - 上传图片 upload_image：multipart/form-data，字段 action=upload_image，
+ *     文件字段 file。
  * 响应：JSON，成功 {"success": true, ...}，失败 {"success": false, "error": "...", "code": "..."}。
  *
  * 鉴权后以配置的 API 用户（默认 muse，须为编辑或管理员）临时登录
@@ -25,6 +27,8 @@
 
 namespace TypechoPlugin\MuseApi;
 
+use Typecho\Common;
+use Typecho\Config;
 use Typecho\Db;
 use Typecho\Widget\Exception as WidgetException;
 use Typecho\Widget\Terminal;
@@ -34,6 +38,7 @@ use Widget\Comments\Admin as CommentsAdmin;
 use Widget\Comments\Edit as CommentsEdit;
 use Widget\Contents\From as PostFrom;
 use Widget\Contents\Post\Edit as PostEdit;
+use Widget\Upload;
 
 if (!defined('__TYPECHO_ROOT_DIR__')) {
     exit;
@@ -42,9 +47,10 @@ if (!defined('__TYPECHO_ROOT_DIR__')) {
 class Action extends Base implements ActionInterface
 {
     /**
-     * 动作分发表：请求里的 action 名 => 本类方法名
-     * （只做评论和文章；没有用户/设置/链接/主题插件/备份/文件操作，
-     *  也没有删除文章接口。）
+     * JSON 动作分发表：请求里的 action 名 => 本类方法名
+     * （只做评论和文章；没有用户/设置/链接/主题插件/备份操作，
+     *  也没有删除文章接口。upload_image 是 multipart 请求，
+     *  不走这张表，见 handleMultipart()。）
      */
     private const DISPATCH = [
         'list_comments'   => 'listComments',
@@ -70,6 +76,18 @@ class Action extends Base implements ActionInterface
     /** 文章写操作 status 参数的合法值 */
     private const POST_WRITE_STATUSES = ['draft', 'publish', 'private', 'waiting', 'hidden'];
 
+    /** 单张图片上传上限（10MB） */
+    private const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+
+    /** 允许上传的图片扩展名 => 检测到的 MIME（扩展名与实测 MIME 必须一致） */
+    private const IMAGE_MIME_BY_EXT = [
+        'jpg'  => 'image/jpeg',
+        'jpeg' => 'image/jpeg',
+        'png'  => 'image/png',
+        'webp' => 'image/webp',
+        'gif'  => 'image/gif',
+    ];
+
     /**
      * Action 入口
      */
@@ -94,6 +112,15 @@ class Action extends Base implements ActionInterface
     {
         if (!$this->request->isPost()) {
             $this->fail('只接受 POST 请求', 405, 'method_not_allowed');
+        }
+
+        // multipart/form-data 只走图片上传分支（upload_image）；
+        // 其余 12 个动作一律走下面的 JSON 分发，不动。
+        $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
+
+        if (str_starts_with(strtolower(trim($contentType)), 'multipart/form-data')) {
+            $this->handleMultipart();
+            return;
         }
 
         $raw = file_get_contents('php://input');
@@ -206,6 +233,152 @@ class Action extends Base implements ActionInterface
         if (!$this->user->simpleLogin((int)$user['uid'])) {
             $this->fail('API 用户登录失败：' . $apiUser, 500, 'api_user_login_failed');
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 图片上传（multipart）
+    // ------------------------------------------------------------------
+
+    /**
+     * multipart 入口：只接受 action=upload_image。
+     * 鉴权在碰文件之前完成（与 JSON 路径一致）。
+     */
+    private function handleMultipart(): void
+    {
+        $action = $_POST['action'] ?? null;
+
+        if (!is_string($action) || 'upload_image' !== $action) {
+            $this->fail('multipart 请求只支持 upload_image', 400, 'bad_request');
+        }
+
+        $this->authenticate();
+        $this->loginApiUser();
+        $this->uploadImage();
+    }
+
+    /**
+     * 上传图片：multipart/form-data，文件字段名 file。
+     *
+     * 只收图片（jpg/jpeg/png/webp/gif），扩展名与实测 MIME 必须一致，
+     * 单文件上限 10MB。存储走核心 Widget\Upload::uploadHandle()（后台
+     * 上传同一条路：usr/uploads/YYYY/MM/、crc32 命名、重名不覆盖），
+     * 再按核心 upload() 的结构把附件行写入 contents 表。
+     */
+    private function uploadImage(): void
+    {
+        $file = $_FILES['file'] ?? null;
+
+        if (!is_array($file)) {
+            $this->fail('缺少文件字段 file', 400, 'missing_file');
+        }
+
+        $error = (int)($file['error'] ?? UPLOAD_ERR_NO_FILE);
+
+        if (UPLOAD_ERR_INI_SIZE === $error || UPLOAD_ERR_FORM_SIZE === $error) {
+            $this->fail('文件超过服务器允许的上传大小', 400, 'file_too_large');
+        }
+
+        if (UPLOAD_ERR_OK !== $error) {
+            $this->fail('文件上传失败（错误码 ' . $error . '）', 400, 'upload_error');
+        }
+
+        $tmpName = (string)($file['tmp_name'] ?? '');
+
+        if ('' === $tmpName || !is_uploaded_file($tmpName)) {
+            $this->fail('文件上传失败', 400, 'upload_error');
+        }
+
+        $size = (int)($file['size'] ?? 0);
+
+        if ($size <= 0) {
+            $size = (int)@filesize($tmpName);
+        }
+
+        if ($size > self::MAX_IMAGE_SIZE) {
+            $this->fail('图片超过 10MB 上限', 400, 'file_too_large');
+        }
+
+        $originalName = (string)($file['name'] ?? '');
+        $ext = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
+
+        if (!isset(self::IMAGE_MIME_BY_EXT[$ext])) {
+            $this->fail('只接受图片（jpg、jpeg、png、webp、gif）', 400, 'bad_file_type');
+        }
+
+        // 实测 MIME（不信任客户端传的 MIME）：必须与扩展名对应
+        $mime = Common::mimeContentType($tmpName);
+
+        if ($mime !== self::IMAGE_MIME_BY_EXT[$ext]) {
+            $this->fail('文件内容与扩展名不符（检测到 ' . $mime . '）', 400, 'bad_file_type');
+        }
+
+        // 核心上传：命名、建目录、移动文件（与后台上传同一条路）
+        $result = Upload::uploadHandle($file);
+
+        if (false === $result || !is_array($result)) {
+            $this->fail('上传失败（该类型可能不在站点允许的附件类型中）', 500, 'upload_failed');
+        }
+
+        // 按核心 upload() 的结构写附件行（title/slug 取原文件名）
+        $struct = [
+            'title'        => $result['name'],
+            'slug'         => $result['name'],
+            'type'         => 'attachment',
+            'status'       => 'publish',
+            'text'         => json_encode($result),
+            'allowComment' => 1,
+            'allowPing'    => 0,
+            'allowFeed'    => 1,
+        ];
+
+        // 用 Upload 组件自己的 insert() 写行（与核心一致的默认值与 slug 处理）。
+        // 注意：Widget::widget() 的 finally 里有 return，会吞掉沙箱回调里
+        // 抛出的异常，所以在回调内捕获、回调外重新抛出（与文章写操作同款）。
+        $caught = null;
+        $aid = 0;
+        Upload::alloc(null, [], function (Upload $u) use ($struct, &$aid, &$caught) {
+            try {
+                $aid = $u->insert($struct);
+            } catch (\Throwable $e) {
+                $caught = $e;
+            }
+        });
+
+        if ($caught) {
+            @unlink(__TYPECHO_ROOT_DIR__ . $result['path']);
+            throw $caught;
+        }
+
+        if ($aid <= 0) {
+            @unlink(__TYPECHO_ROOT_DIR__ . $result['path']);
+            $this->fail('上传失败（附件记录写入失败）', 500, 'upload_failed');
+        }
+
+        // 核对：附件行必须确实存在且路径一致
+        $row = $this->db->fetchRow($this->db->select()->from('table.contents')
+            ->where('cid = ?', $aid)->where('type = ?', 'attachment')->limit(1));
+
+        if (!$row) {
+            @unlink(__TYPECHO_ROOT_DIR__ . $result['path']);
+            $this->fail('上传失败（附件记录写入失败）', 500, 'upload_failed');
+        }
+
+        $stored = json_decode((string)($row['text'] ?? ''), true);
+
+        if (!is_array($stored) || ($stored['path'] ?? '') !== $result['path']) {
+            $this->fail('上传失败（附件记录校验失败）', 500, 'upload_failed');
+        }
+
+        $this->ok(['attachment' => [
+            'aid'          => $aid,
+            'url'          => Upload::attachmentHandle(new Config($result)),
+            'filename'     => basename($result['path']),
+            'originalName' => $result['name'],
+            'path'         => $result['path'],
+            'size'         => (int)$result['size'],
+            'mime'         => $result['mime'],
+            'type'         => $result['type'],
+        ]]);
     }
 
     // ------------------------------------------------------------------

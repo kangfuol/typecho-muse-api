@@ -1,16 +1,19 @@
 <?php
 /**
- * MuseApi —— 给可信客户端用的 Typecho 评论/文章管理 API（Token 鉴权）
+ * MuseApi —— 给 Muse 用的 Typecho 评论/文章/图片管理 API（Token 鉴权）
  *
- * 只做两件事：管理评论、管理文章。编辑级权限，不碰用户、设置、链接、
- * 主题插件、备份和文件。v1 不提供删除文章接口（删文章请在后台手动操作）。
+ * 做三件事：管理评论、管理文章、上传图片。编辑级权限，不碰用户、设置、
+ * 链接、主题插件、备份和文件。v1.1 不提供删除文章接口（删文章请在后台
+ * 手动操作）。图片上传只收图片（jpg/jpeg/png/webp/gif），单文件上限 10MB。
  *
  * 鉴权：每次请求在 X-Muse-Token 请求头里带 Token（见插件设置页）。
- * 路由：POST /index.php/action/muse-api，JSON 请求体 {"action": "...", ...}。
+ * 路由：POST /index.php/action/muse-api，评论/文章走 JSON 请求体
+ * {"action": "...", ...}；上传图片走 multipart/form-data（action=upload_image，
+ * 文件字段 file）。
  *
  * @package MuseApi
  * @author Muse
- * @version 1.0.0
+ * @version 1.1.0
  * @link https://github.com/kangfuol/typecho-muse-api
  */
 
