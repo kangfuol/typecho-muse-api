@@ -1,7 +1,7 @@
 # MuseApi —— Typecho 评论 / 文章 / 图片管理 API（Token 鉴权）
 
 给 Muse（或其他可信客户端）用的最小化管理接口，让 Typecho 博客
-能像 WordPress 那样走 API 托管评论、文章和图片上传。
+（fansun.net）能像 WordPress 那样走 API 托管评论、文章和图片上传。
 
 - **只做三件事**：管理评论、管理文章、上传图片。编辑级权限。
 - **不做**：用户管理、设置修改、链接、主题/插件、备份、除图片上传外
@@ -16,9 +16,12 @@
    `usr/plugins/`，即 `usr/plugins/MuseApi/Plugin.php`、
    `usr/plugins/MuseApi/Action.php`。
    **注意权限**：两个 `.php` 文件必须能被 Web 服务器（PHP 进程）
-   读取，一般是 `644`。如果传上去是 `660` 且属主是 root，PHP 读不到，
-   后台会显示“此插件文件已经损坏或者被不安全移除”——这时先把权限改
-   成 `644` 再刷新页面，**不要点禁用**（停用会删 Token）。
+   读取，一般是 `644` 或 `664`。宝塔面板点“解压”时，它的 umask
+   （027）会把文件压成 `640`，PHP 读不到，后台就会显示“此插件文件
+   已经损坏或者被不安全移除”——这时把两个文件的权限改成 `644` 或
+   `664` 再刷新页面即可，**不要点禁用**（停用会删 Token）。
+   用宝塔终端解压可以先 `umask 022` 再解压，就不用事后改权限。
+   你的步骤没错，这是宝塔解压的默认行为，不是装错了。
 2. 后台 → 插件 → 找到 **MuseApi** → 启用。
    启用时自动生成一个 48 字符的随机 Token 并注册接口路由。
 3. 后台 → 插件 → MuseApi 的「设置」，复制 **API Token**，
@@ -26,7 +29,7 @@
 4. 设置里还有 **API 用户名**（默认 `muse`），接口以该用户的身份执行
    操作，该用户必须是编辑或管理员。
 
-接口地址：`POST https://your-blog.example/index.php/action/muse-api`
+接口地址：`POST https://fansun.net/index.php/action/muse-api`
 
 > **从 v1.1 升级到 v1.1.1**：直接用新版 `Plugin.php`、`Action.php`
 > 覆盖 `usr/plugins/MuseApi/` 下的同名文件即可，**不需要停用再启用**，
@@ -241,7 +244,7 @@ X-Muse-Token: <Token>
 与其他接口不同，这个接口用 `multipart/form-data`，不要发 JSON：
 
 ```bash
-curl -X POST "https://your-blog.example/index.php/action/muse-api" \
+curl -X POST "https://fansun.net/index.php/action/muse-api" \
   -H "X-Muse-Token: <Token>" \
   -F "action=upload_image" \
   -F "file=@/path/to/photo.jpg"
@@ -265,7 +268,7 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
   "success": true,
   "attachment": {
     "aid": 123,
-    "url": "https://your-blog.example/usr/uploads/2026/11/4227869332.jpg",
+    "url": "https://fansun.net/usr/uploads/2026/11/4227869332.jpg",
     "filename": "4227869332.jpg",
     "originalName": "photo.jpg",
     "path": "/usr/uploads/2026/11/4227869332.jpg",
@@ -368,7 +371,7 @@ curl -X POST "https://your-blog.example/index.php/action/muse-api" \
 - **v1.1.1 补测**（同一本地环境）：模拟 fileinfo 损坏（强制返回
   `application/octet-stream`）后，真 JPEG/PNG/GIF/WebP 仍可上传成功，
   文本冒充 `.jpg` 仍被拒绝；正常路径的上传与回归接口均不受影响。
-- 已在真实站点上安装 v1.1.0 并验证：只读接口正常，Token 有效；
+- 已在 fansun.net 线上站安装 v1.1.0 并验证：只读接口正常，Token 有效；
   但线上站的 fileinfo 会把真图片认成 `application/octet-stream`，
   导致 v1.1.0 的上传被拒——v1.1.1 已针对性修复，升级后请再试传一张。
   线上 PHP 的 `upload_max_filesize` / `post_max_size` 若小于 10MB，
